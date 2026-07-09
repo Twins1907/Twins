@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.venv/
+venv/
+
+# Generated CAD/output artifacts
+*.dxf
+*.dwg
+
+# Keep the committed demo assets
+!samples/preview_before_after.png

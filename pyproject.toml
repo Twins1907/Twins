@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scan2dwg"
+version = "0.1.0"
+description = "Convert raster scans of 2D drawings into DXF/DWG CAD files."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Twins" }]
+keywords = ["cad", "dxf", "dwg", "raster-to-vector", "scan", "vectorization"]
+dependencies = [
+    "numpy>=1.21",
+    "opencv-python-headless>=4.5",
+    "ezdxf>=1.0",
+    "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.22"]
+ocr = ["pytesseract>=0.3.10"]
+all = ["pymupdf>=1.22", "pytesseract>=0.3.10"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+scan2dwg = "scan2dwg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["scan2dwg*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
