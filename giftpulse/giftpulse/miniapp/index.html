@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>GiftPulse</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* Telegram injects theme variables per user; deriving from them rather than
+     hardcoding colours is what makes a Mini App feel native in both themes. */
+  :root {
+    --bg: var(--tg-theme-bg-color, #17212b);
+    --card: var(--tg-theme-secondary-bg-color, #232e3c);
+    --text: var(--tg-theme-text-color, #f5f5f5);
+    --hint: var(--tg-theme-hint-color, #7d8b99);
+    --link: var(--tg-theme-link-color, #6ab3f3);
+    --button: var(--tg-theme-button-color, #5288c1);
+    --button-text: var(--tg-theme-button-text-color, #ffffff);
+    --up: #4ac26b;
+    --down: #f2585b;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    padding: 0 0 32px;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header { padding: 18px 16px 10px; }
+  h1 { margin: 0; font-size: 21px; letter-spacing: -0.02em; }
+  .sub { color: var(--hint); font-size: 13px; margin-top: 3px; }
+  main { padding: 0 16px; }
+
+  .card {
+    background: var(--card);
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 10px;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .name { font-weight: 600; }
+  .price { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .meta { color: var(--hint); font-size: 12.5px; margin-top: 4px; }
+  .badge {
+    display: inline-block; padding: 2px 7px; border-radius: 6px;
+    font-size: 11.5px; font-weight: 600; background: rgba(106,179,243,.16); color: var(--link);
+  }
+  .badge.hot { background: rgba(74,194,107,.16); color: var(--up); }
+  .up { color: var(--up); } .down { color: var(--down); }
+
+  button {
+    width: 100%; border: 0; border-radius: 11px; padding: 13px;
+    background: var(--button); color: var(--button-text);
+    font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 10px;
+  }
+  button.ghost { background: transparent; color: var(--link); border: 1px solid var(--hint); }
+  button:disabled { opacity: .5; }
+
+  .venues { margin-top: 10px; border-top: 1px solid rgba(125,139,153,.2); padding-top: 10px; }
+  .venue { display: flex; justify-content: space-between; padding: 5px 0; font-size: 13.5px; }
+  .venue .best { color: var(--up); font-weight: 600; }
+
+  .empty { color: var(--hint); text-align: center; padding: 40px 20px; font-size: 14px; }
+  .note { color: var(--hint); font-size: 12px; text-align: center; padding: 14px 8px 0; }
+  .back { color: var(--link); font-size: 14px; padding: 4px 0 12px; display: inline-block; cursor: pointer; }
+  svg.spark { width: 100%; height: 64px; display: block; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>GiftPulse</h1>
+  <div class="sub" id="subtitle">Scanning every venue…</div>
+</header>
+<main id="app"><div class="empty">Loading market…</div></main>
+
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.ready();
+tg?.expand();
+
+const initData = tg?.initData || "";
+const app = document.getElementById("app");
+const subtitle = document.getElementById("subtitle");
+
+function haptic(style = "light") {
+  try { tg?.HapticFeedback?.impactOccurred(style); } catch (_) {}
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Telegram-Init-Data": initData,
+      ...(options.headers || {}),
+    },
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || `Request failed (${response.status})`);
+  }
+  return response.json();
+}
+
+function ton(value) {
+  return Number(value).toLocaleString(undefined, {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"]/g, ch =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+}
+
+// --- list view ------------------------------------------------------------
+
+async function renderList() {
+  tg?.BackButton?.hide();
+  try {
+    const collections = await api("/api/collections");
+    if (!collections.length) {
+      app.innerHTML = `<div class="empty">No market data indexed yet.<br>
+        Start the indexer and refresh in a minute.</div>`;
+      subtitle.textContent = "Waiting for the indexer";
+      return;
+    }
+
+    subtitle.textContent = `${collections.length} collections · sorted by spread`;
+    app.innerHTML = collections.map(item => {
+      const hot = item.spread_pct >= 8;
+      return `
+        <div class="card" data-collection="${escapeHtml(item.collection)}">
+          <div class="row">
+            <span class="name">${escapeHtml(item.collection)}</span>
+            <span class="price">${ton(item.best_floor_ton)} TON</span>
+          </div>
+          <div class="row">
+            <span class="meta">cheapest on <b>${escapeHtml(item.best_venue)}</b></span>
+            ${item.spread_pct > 0
+              ? `<span class="badge ${hot ? "hot" : ""}">${item.spread_pct}% spread</span>`
+              : ""}
+          </div>
+        </div>`;
+    }).join("");
+
+    app.querySelectorAll("[data-collection]").forEach(card => {
+      card.addEventListener("click", () => {
+        haptic();
+        renderDetail(card.dataset.collection);
+      });
+    });
+  } catch (error) {
+    app.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+// --- detail view ----------------------------------------------------------
+
+async function renderDetail(collection) {
+  app.innerHTML = `<div class="empty">Loading ${escapeHtml(collection)}…</div>`;
+  subtitle.textContent = collection;
+
+  tg?.BackButton?.show();
+  tg?.BackButton?.onClick(renderList);
+
+  try {
+    const [detail, history] = await Promise.all([
+      api(`/api/floors/${encodeURIComponent(collection)}`),
+      api(`/api/history/${encodeURIComponent(collection)}?hours=24`).catch(() => []),
+    ]);
+
+    const best = detail.venues[0];
+    const delta = detail.change_24h_pct;
+    const deltaHtml = delta === null || delta === undefined
+      ? ""
+      : `<div class="meta ${delta < 0 ? "down" : "up"}">
+           ${delta < 0 ? "▼" : "▲"} ${delta.toFixed(2)}% in 24h</div>`;
+
+    app.innerHTML = `
+      <span class="back" id="back">← All collections</span>
+      <div class="card">
+        <div class="row">
+          <span class="name">${escapeHtml(collection)}</span>
+          <span class="price">${ton(best.floor_ton)} TON</span>
+        </div>
+        <div class="meta">floor on <b>${escapeHtml(best.venue)}</b> · ${best.listing_count} listed</div>
+        ${deltaHtml}
+        ${sparkline(history)}
+        <div class="venues">
+          ${detail.venues.map((venue, index) => `
+            <div class="venue">
+              <span>${escapeHtml(venue.venue)}</span>
+              <span class="${index === 0 ? "best" : ""}">${ton(venue.floor_ton)} TON</span>
+            </div>`).join("")}
+        </div>
+        <div class="meta" style="margin-top:10px">
+          7d on-chain volume: ${ton(detail.onchain_volume_7d_ton)} TON
+        </div>
+        <button id="buy">Get best price</button>
+        <button class="ghost" id="watch">Set a price alert</button>
+      </div>
+      <div class="note">
+        GiftPulse never holds your keys, funds, or gifts.<br>
+        Every purchase is signed in your own wallet.
+      </div>`;
+
+    document.getElementById("back").onclick = () => { haptic(); renderList(); };
+    document.getElementById("buy").onclick = () => buy(collection);
+    document.getElementById("watch").onclick = () => setWatch(collection, best.floor_ton);
+  } catch (error) {
+    app.innerHTML = `<span class="back" id="back">← All collections</span>
+      <div class="empty">${escapeHtml(error.message)}</div>`;
+    document.getElementById("back").onclick = renderList;
+  }
+}
+
+// Inline sparkline — a 40-line SVG beats shipping a charting library into a
+// Mini App that has to open instantly on a phone.
+function sparkline(points) {
+  if (!points || points.length < 2) return "";
+  const values = points.map(point => point.floor_ton);
+  const min = Math.min(...values), max = Math.max(...values);
+  const span = max - min || 1;
+  const step = 100 / (values.length - 1);
+  const path = values
+    .map((value, index) => `${index === 0 ? "M" : "L"}${(index * step).toFixed(2)},${(28 - ((value - min) / span) * 24).toFixed(2)}`)
+    .join(" ");
+  const rising = values[values.length - 1] >= values[0];
+  return `<svg class="spark" viewBox="0 0 100 32" preserveAspectRatio="none">
+    <path d="${path}" fill="none" stroke="${rising ? "#4ac26b" : "#f2585b"}"
+          stroke-width="1.4" vector-effect="non-scaling-stroke" />
+  </svg>`;
+}
+
+async function buy(collection) {
+  const button = document.getElementById("buy");
+  button.disabled = true;
+  button.textContent = "Finding best venue…";
+  try {
+    const quote = await api("/api/quote", {
+      method: "POST",
+      body: JSON.stringify({ collection }),
+    });
+    haptic("medium");
+
+    const savings = quote.savings_ton > 0
+      ? `\n\nYou save ${ton(quote.savings_ton)} TON (${quote.savings_pct}%) versus ${quote.runner_up_venue}.`
+      : "";
+    const fee = quote.fee_ton > 0 ? `\nRouting fee: ${ton(quote.fee_ton)} TON` : "";
+
+    tg?.showPopup?.({
+      title: "Best price found",
+      message: `${collection} — ${ton(quote.price_ton)} TON on ${quote.venue}.${savings}${fee}`,
+      buttons: [{ id: "go", type: "default", text: "Open listing" }, { type: "cancel" }],
+    }, id => { if (id === "go") tg?.openTelegramLink?.(quote.deep_link); });
+  } catch (error) {
+    tg?.showAlert?.(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "Get best price";
+  }
+}
+
+async function setWatch(collection, floor) {
+  const suggested = (floor * 0.9).toFixed(2);
+  // showPopup has no text input, so the bot owns the typed flow.
+  tg?.showPopup?.({
+    title: "Price alert",
+    message: `Alert me when ${collection} drops to ${suggested} TON (10% below floor)?`,
+    buttons: [{ id: "set", type: "default", text: "Set alert" }, { type: "cancel" }],
+  }, async id => {
+    if (id !== "set") return;
+    try {
+      await api("/api/watches", {
+        method: "POST",
+        body: JSON.stringify({ collection, target_ton: Number(suggested) }),
+      });
+      haptic("medium");
+      tg?.showAlert?.(`Watching ${collection} at ${suggested} TON.`);
+    } catch (error) {
+      tg?.showAlert?.(error.message);
+    }
+  });
+}
+
+renderList();
+</script>
+</body>
+</html>

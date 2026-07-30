@@ -1,0 +1,30 @@
+services:
+  giftpulse:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GIFTPULSE_DATABASE_URL: postgresql+asyncpg://giftpulse:giftpulse@db:5432/giftpulse
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: giftpulse
+      POSTGRES_PASSWORD: giftpulse
+      POSTGRES_DB: giftpulse
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U giftpulse"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
