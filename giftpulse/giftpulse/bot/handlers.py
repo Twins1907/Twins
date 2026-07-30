@@ -17,7 +17,7 @@ from giftpulse.indexer.service import TRACKED_COLLECTIONS
 from giftpulse.models import User, Watch
 from giftpulse.routing.engine import RoutingEngine
 from giftpulse.routing.referral import parse_start_payload, user_referral_code
-from giftpulse.venues.registry import build_adapters, build_client
+from giftpulse.venues.registry import get_shared_pool
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -248,12 +248,9 @@ async def watches_callback(query: CallbackQuery) -> None:
 
 async def _floor_text(collection: str):  # noqa: ANN202
     settings = get_settings()
-    client = build_client(settings)
-    try:
-        router_engine = RoutingEngine(build_adapters(client, settings), settings)
-        quote = await router_engine.best_buy(collection)
-    finally:
-        await client.aclose()
+    pool = get_shared_pool(settings)
+    router_engine = RoutingEngine(pool.adapters, settings)
+    quote = await router_engine.best_buy(collection)
 
     if quote is None:
         # Fall back to indexed data — a live venue hiccup should not leave the

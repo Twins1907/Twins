@@ -18,6 +18,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +32,7 @@ giftpulse = "giftpulse.main:cli"
 include = ["giftpulse*"]
 
 [tool.setuptools.package-data]
-giftpulse = ["miniapp/*.html"]
+giftpulse = ["miniapp/*.html", "migrations/*.py", "migrations/*.mako", "migrations/versions/*.py"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -40,6 +41,8 @@ filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100
+# Alembic writes these; reformatting them fights `alembic revision`.
+extend-exclude = ["giftpulse/migrations/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

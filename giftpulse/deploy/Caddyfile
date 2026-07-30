@@ -1,0 +1,21 @@
+# TLS termination for the Mini App.
+#
+# Caddy obtains and renews a certificate automatically, which is the whole reason
+# it is here: Telegram will not open a Mini App over plain HTTP, and a self-signed
+# certificate fails the same way.
+
+{$GIFTPULSE_DOMAIN} {
+	encode gzip
+
+	# The Mini App is loaded inside Telegram's web client, so it must be
+	# framable there and nowhere else.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	reverse_proxy giftpulse:8080 {
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Real-IP {remote_host}
+	}
+}

@@ -6,9 +6,10 @@ being written twice and drifting.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from giftpulse.models import FloorSnapshot, RoutedTrade, SaleEvent
@@ -46,15 +47,55 @@ async def latest_floors(session: AsyncSession, collection: str) -> list[dict]:
     ]
 
 
+def _epoch_seconds(session: AsyncSession):  # noqa: ANN201
+    """Portable "captured_at as a UNIX timestamp" expression.
+
+    SQLite and Postgres spell this differently and there is no common syntax, so the
+    dialect branch lives here once instead of in every caller.
+    """
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        return cast(func.strftime("%s", FloorSnapshot.captured_at), Integer)
+    return cast(func.extract("epoch", FloorSnapshot.captured_at), Integer)
+
+
 async def floor_history(
-    session: AsyncSession, collection: str, hours: int = 24, venue: str | None = None
+    session: AsyncSession,
+    collection: str,
+    hours: int = 24,
+    venue: str | None = None,
+    max_points: int = 180,
 ) -> list[dict]:
-    """Floor points over a window, for the Mini App chart."""
+    """Floor points over a window, for the Mini App chart.
+
+    Downsampled in the database. A 60-second poll across three venues produces
+    ~4,300 rows for a day and ~130,000 for a month; a chart a few hundred pixels
+    wide cannot draw any of that, so sending it is bandwidth and parse time spent to
+    render the same line.
+
+    ``max_points`` is per venue — a three-venue chart returns up to three times as
+    many rows, because each venue draws its own line.
+    """
     since = datetime.now(UTC) - timedelta(hours=hours)
+    # Buckets align to absolute epoch rather than to the window start, so that the
+    # same instant lands in the same bucket on every request and the chart does not
+    # shimmer as time passes. The cost is that a window can straddle one more
+    # boundary than a naive division suggests, so divide by one fewer interval to
+    # keep max_points an actual maximum.
+    intervals = max(1, max_points - 1)
+    bucket_seconds = max(60, math.ceil(hours * 3600 / intervals))
+    bucket = cast(_epoch_seconds(session) / bucket_seconds, Integer).label("bucket")
+
     query = (
-        select(FloorSnapshot)
+        select(
+            FloorSnapshot.venue,
+            bucket,
+            func.min(FloorSnapshot.floor_ton).label("floor_ton"),
+            func.min(FloorSnapshot.captured_at).label("captured_at"),
+        )
         .where(FloorSnapshot.collection == collection, FloorSnapshot.captured_at >= since)
-        .order_by(FloorSnapshot.captured_at.asc())
+        .group_by(FloorSnapshot.venue, bucket)
+        .order_by(func.min(FloorSnapshot.captured_at).asc())
     )
     if venue:
         query = query.where(FloorSnapshot.venue == venue)
@@ -63,11 +104,16 @@ async def floor_history(
     return [
         {
             "venue": row.venue,
-            "floor_ton": row.floor_ton,
-            "captured_at": row.captured_at.isoformat(),
+            "floor_ton": round(float(row.floor_ton), 2),
+            "captured_at": _isoformat(row.captured_at),
         }
-        for row in rows.scalars()
+        for row in rows
     ]
+
+
+def _isoformat(moment: datetime | str) -> str:
+    """Timestamps come back as datetimes on Postgres and strings on SQLite."""
+    return moment.isoformat() if isinstance(moment, datetime) else str(moment)
 
 
 async def collection_overview(session: AsyncSession, collections: list[str]) -> list[dict]:
@@ -96,47 +142,101 @@ async def collection_overview(session: AsyncSession, collections: list[str]) -> 
     return overview
 
 
+# How wide a window either side of the lookback point counts as "then". Wide enough
+# to survive a missed poll, narrow enough that it is still a point in time.
+_BASELINE_WINDOW = timedelta(minutes=30)
+
+# Snapshots this close to the newest one are treated as "now" — the three venues in
+# a single cycle do not land on the same millisecond.
+_CURRENT_WINDOW = timedelta(minutes=5)
+
+
 async def change_pct(session: AsyncSession, collection: str, hours: int = 24) -> float | None:
-    """Percent change in best floor over a window. None if there is no baseline yet."""
+    """Percent change in best floor over a window. None if there is no baseline yet.
+
+    Both ends are the cheapest floor *at a point in time*. Aggregating without a
+    time bound — which is what an unbounded ``min()`` does — compares the all-time
+    low against the all-time low and reports a change of zero forever.
+    """
     since = datetime.now(UTC) - timedelta(hours=hours)
-    old = await session.execute(
+
+    baseline_result = await session.execute(
         select(func.min(FloorSnapshot.floor_ton)).where(
             FloorSnapshot.collection == collection,
-            FloorSnapshot.captured_at <= since,
+            FloorSnapshot.captured_at >= since - _BASELINE_WINDOW,
+            FloorSnapshot.captured_at <= since + _BASELINE_WINDOW,
         )
     )
-    baseline = old.scalar_one_or_none()
+    baseline = baseline_result.scalar_one_or_none()
     if not baseline:
         return None
 
-    current = await session.execute(
-        select(func.min(FloorSnapshot.floor_ton))
-        .where(FloorSnapshot.collection == collection)
-        .order_by(FloorSnapshot.captured_at.desc())
-        .limit(1)
+    latest_result = await session.execute(
+        select(func.max(FloorSnapshot.captured_at)).where(
+            FloorSnapshot.collection == collection
+        )
     )
-    now_value = current.scalar_one_or_none()
+    latest_at = latest_result.scalar_one_or_none()
+    if latest_at is None:
+        return None
+    if latest_at.tzinfo is None:
+        latest_at = latest_at.replace(tzinfo=UTC)
+
+    current_result = await session.execute(
+        select(func.min(FloorSnapshot.floor_ton)).where(
+            FloorSnapshot.collection == collection,
+            FloorSnapshot.captured_at >= latest_at - _CURRENT_WINDOW,
+        )
+    )
+    now_value = current_result.scalar_one_or_none()
     if not now_value:
         return None
     return round((now_value - baseline) / baseline * 100, 2)
 
 
 async def routed_volume_ton(session: AsyncSession, days: int = 30) -> dict:
-    """Routed volume and fees — the metric the whole thesis is judged on."""
+    """Routed volume and fees — the metric the whole thesis is judged on.
+
+    Volume counts settled trades only. A quote is a price lookup: it costs nothing,
+    commits nobody, and earns nothing. Counting quotes as volume would mean anyone
+    opening the scanner inflates the number the product is judged on, which is the
+    quickest way to be wrong about whether this business works.
+
+    Quote counts are still reported, because quote→confirmed is the conversion rate
+    that says whether the sign flow is working.
+    """
     since = datetime.now(UTC) - timedelta(days=days)
-    result = await session.execute(
+
+    settled = await session.execute(
         select(
             func.coalesce(func.sum(RoutedTrade.price_ton), 0.0),
             func.coalesce(func.sum(RoutedTrade.fee_ton), 0.0),
             func.count(RoutedTrade.id),
-        ).where(RoutedTrade.created_at >= since, RoutedTrade.status.in_(["built", "confirmed"]))
+        ).where(
+            RoutedTrade.created_at >= since,
+            RoutedTrade.status.in_(RoutedTrade.REVENUE_STATUSES),
+        )
     )
-    volume, fees, count = result.one()
+    volume, fees, trades = settled.one()
+
+    funnel = await session.execute(
+        select(RoutedTrade.status, func.count(RoutedTrade.id))
+        .where(RoutedTrade.created_at >= since)
+        .group_by(RoutedTrade.status)
+    )
+    by_status = {status: int(count) for status, count in funnel}
+    quotes = by_status.get(RoutedTrade.QUOTED, 0)
+
     return {
         "days": days,
         "routed_volume_ton": round(float(volume), 2),
         "fee_ton": round(float(fees), 4),
-        "trade_count": int(count),
+        "trade_count": int(trades),
+        "quote_count": quotes,
+        "by_status": by_status,
+        "quote_to_trade_pct": (
+            round(int(trades) / quotes * 100, 2) if quotes else None
+        ),
     }
 
 

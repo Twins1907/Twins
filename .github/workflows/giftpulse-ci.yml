@@ -1,0 +1,59 @@
+name: giftpulse CI
+
+on:
+  push:
+    paths: ["giftpulse/**", ".github/workflows/giftpulse-ci.yml"]
+  pull_request:
+    paths: ["giftpulse/**", ".github/workflows/giftpulse-ci.yml"]
+
+defaults:
+  run:
+    working-directory: giftpulse
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is what pyproject claims to support; the ceiling is what the
+        # container image runs. Both have to work, or one of those is a lie.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev,postgres]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -q
+
+      - name: Migrations apply to an empty database
+        # Guards the failure that only appears on a fresh deploy, where there is no
+        # existing schema for create_all to paper over.
+        env:
+          GIFTPULSE_DATABASE_URL: sqlite+aiosqlite:///./ci.db
+        run: giftpulse migrate
+
+      - name: Models and migrations agree
+        # Fails when someone edits models.py without generating a revision. That
+        # drift is invisible in development, where the database already has the
+        # column, and fatal on a fresh deploy, where it does not.
+        env:
+          GIFTPULSE_DATABASE_URL: sqlite:///./ci.db
+        run: alembic check
+
+      - name: Smoke test the pipeline end to end
+        env:
+          GIFTPULSE_DATABASE_URL: sqlite+aiosqlite:///./ci.db
+          GIFTPULSE_MOCK: "true"
+        run: giftpulse indexer --once

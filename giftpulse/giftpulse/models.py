@@ -84,6 +84,10 @@ class AlertLog(Base):
     body: Mapped[str] = mapped_column(String(2048))
     sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    # The hourly channel budget counts rows in this window on every dispatch, so
+    # it wants an index of its own rather than riding the dedupe_key one.
+    __table_args__ = (Index("ix_alert_sent_at", "sent_at"),)
+
 
 class User(Base):
     """A bot user. Wallet address is public data; keys never touch this process."""
@@ -122,10 +126,25 @@ class Watch(Base):
 
 
 class RoutedTrade(Base):
-    """A buy the routing engine built. Recorded when the user is handed a signable
-    transaction, confirmed when the chain settles. Never contains key material."""
+    """A buy the routing engine priced. Never contains key material.
+
+    ``status`` is the difference between a metric and a vanity number:
+
+      quoted     a price was shown. Costs nothing, means nothing.
+      built      a signable transaction was handed to the user's wallet.
+      confirmed  the chain settled it. This is the only status that is revenue.
+
+    Routed volume counts ``confirmed`` alone. Counting quotes would let anyone
+    inflate the number the whole thesis is judged on just by opening the scanner.
+    """
 
     __tablename__ = "routed_trades"
+
+    QUOTED = "quoted"
+    BUILT = "built"
+    CONFIRMED = "confirmed"
+    # Statuses that represent real economic activity rather than a price lookup.
+    REVENUE_STATUSES = (CONFIRMED,)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
@@ -134,5 +153,28 @@ class RoutedTrade(Base):
     listing_id: Mapped[str] = mapped_column(String(128))
     price_ton: Mapped[float] = mapped_column(Float)
     fee_ton: Mapped[float] = mapped_column(Float, default=0.0)
-    status: Mapped[str] = mapped_column(String(24), default="built", index=True)
+    status: Mapped[str] = mapped_column(String(24), default=QUOTED, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    __table_args__ = (Index("ix_trade_status_time", "status", "created_at"),)
+
+
+class ServiceHeartbeat(Base):
+    """Last known health of a background loop.
+
+    Without this, a dead indexer looks exactly like a quiet market: the channel
+    simply stops posting and nobody finds out until a user asks. The API reads this
+    table to decide whether it is serving fresh data or stale data with confidence.
+    """
+
+    __tablename__ = "service_heartbeat"
+
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_failure_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    detail: Mapped[str] = mapped_column(String(512), default="")

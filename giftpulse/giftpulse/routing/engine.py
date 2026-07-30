@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from giftpulse.config import Settings, get_settings
 from giftpulse.venues.base import FloorQuote, Listing, VenueAdapter
 
 log = logging.getLogger(__name__)
+
+# How long a signable quote stays valid. Short on purpose: floors move.
+_QUOTE_TTL_SECONDS = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +168,9 @@ class RoutingEngine:
             runner_up_price_ton=runner_up.price_ton if runner_up else 0.0,
         )
 
-    def build_payment_request(self, quote: BuyQuote, wallet_address: str) -> dict:
+    def build_payment_request(
+        self, quote: BuyQuote, wallet_address: str, now: float | None = None
+    ) -> dict:
         """A TON Connect transaction request for the user's wallet to sign.
 
         Returned as a plain dict and handed to the client — the Mini App passes it
@@ -187,10 +193,22 @@ class RoutingEngine:
                 }
             )
 
+        # A wallet rejects a transaction with no messages, and handing the user a
+        # signature prompt that cannot succeed is worse than not offering one. With
+        # no fee leg there is nothing on-chain for us to construct yet — the buy
+        # completes through the referral deep link instead.
+        if not messages:
+            raise ValueError(
+                "no on-chain legs to sign: enable an execution fee or use the "
+                "referral deep link for this venue"
+            )
+
         return {
-            # 5 minutes: long enough for a human to read and sign, short enough that
-            # a stale quote cannot be executed after the floor has moved.
-            "validUntil": 300,
+            # Absolute UNIX seconds, which is what TON Connect expects — a relative
+            # duration here reads as 1970 and every wallet rejects it as expired.
+            # Five minutes: long enough for a human to read and sign, short enough
+            # that a stale quote cannot execute after the floor has moved.
+            "validUntil": int(now if now is not None else time.time()) + _QUOTE_TTL_SECONDS,
             "messages": messages,
             "meta": {
                 "venue": quote.venue,

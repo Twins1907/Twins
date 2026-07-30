@@ -71,7 +71,9 @@ class MockAdapter(VenueAdapter):
         tick: int = 0,
         drift: float = 0.0,
     ) -> None:
-        super().__init__(client, referral_code)
+        # max_rps=0 disables pacing: there is no venue on the other end of this to
+        # be polite to, and throttling it would only slow the tests down.
+        super().__init__(client, referral_code, max_rps=0.0)
         self.slug = slug
         self.display_name = display_name
         # Advanced by the caller to simulate the passage of time.

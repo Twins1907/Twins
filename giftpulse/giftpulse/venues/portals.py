@@ -25,10 +25,19 @@ class PortalsAdapter(VenueAdapter):
     display_name = "Portals"
     base_url = "https://portals-market.com/api"
 
-    def __init__(self, client, referral_code: str = "", auth_data: str = "") -> None:  # noqa: ANN001
-        super().__init__(client, referral_code)
+    def __init__(  # noqa: ANN001
+        self,
+        client,
+        referral_code: str = "",
+        auth_data: str = "",
+        **pacing: object,
+    ) -> None:
+        super().__init__(client, referral_code, **pacing)  # type: ignore[arg-type]
         self.auth_data = auth_data
-        self._auth_warned = False
+        # A missing credential is the same operational fact as a rejected one:
+        # this venue is dark until a human supplies a fresh authData.
+        if not auth_data:
+            self.auth_expired = True
 
     @property
     def authenticated(self) -> bool:

@@ -65,10 +65,13 @@ giftpulse all      # indexer + bot + API in one process, fine for a single VPS
 | `giftpulse bot` | Telegram command surface |
 | `giftpulse api` | Mini App backend and static shell |
 | `giftpulse all` | All three in one process |
+| `giftpulse migrate` | Bring the database schema to head and exit |
 
 Separate processes because they scale differently and because a wedged indexer
 should not take the bot down with it. `indexer --once` and `--dry-run` exist so you
 can inspect what the rules would fire before pointing them at a live channel.
+
+All of them stop cleanly on SIGTERM rather than being torn down mid-cycle.
 
 ## Design notes
 
@@ -107,6 +110,25 @@ which is which and `onchain_volume_ton()` counts only settled trades.
 the routing advantage, `BuyQuote.beats_runner_up` is False rather than the quote
 claiming a saving the user won't get.
 
+**A quote is not a trade.** `RoutedTrade.status` separates `quoted` from `confirmed`,
+and routed volume counts only the latter. Counting price lookups as volume would let
+anyone inflate the number the whole thesis is judged on just by opening the scanner.
+
+**The channel has an hourly budget, not just a cooldown.** Cooldown stops the same
+event repeating. It cannot see that a market-wide move has produced thirty *distinct*
+events, which is what actually costs subscribers. `alert_max_per_hour` caps the total
+and the most actionable alerts win the budget: spreads and floor breaks before whale
+prints and supply bursts.
+
+**Deltas need an aged baseline.** A rule comparing against the previous poll is a
+60-second momentum detector. `alert_min_baseline_minutes` means a fresh deployment
+stays quiet until it has enough history to say something true.
+
+**A dead indexer is louder than a quiet market.** Both look identical from outside —
+the channel simply stops. The indexer records every cycle outcome to
+`service_heartbeat`, `/api/health` returns 503 once that goes stale, and the admin
+chat hears about repeated failures and rejected credentials.
+
 ## Security
 
 The custody boundary is the product's main risk surface, so it is enforced in code
@@ -125,14 +147,31 @@ rather than by convention:
 ## Tests
 
 ```bash
-pytest          # 54 tests, no network required
-ruff check .
+make check      # lint + 84 tests + migration drift, no network required
 ```
 
 The suite runs entirely against mock venues and in-memory SQLite, so it is
 deterministic and offline. Coverage is weighted toward the parts that are expensive
 to get wrong: alert rule thresholds, fee arithmetic, referral attachment, venue
-failure handling, and initData verification.
+failure handling, initData verification, and the production failure modes in
+`tests/test_production.py` — transaction expiry, duplicate whale alerts, the alert
+budget, retention, and transport retry behaviour.
+
+`make check` also runs `alembic check`, which fails when `models.py` has changed
+without a matching migration. That drift is invisible in development, where the
+database already has the column, and fatal on a fresh deploy.
+
+## Deploying
+
+See [`docs/DEPLOY.md`](docs/DEPLOY.md) for the runbook — in particular step 1, which
+is validating the venue adapters against live APIs. Every field name in
+`giftpulse/venues/*.py` comes from documented shapes rather than an observed
+response, and the adapters degrade quietly by design, so a wrong field name shows up
+as an empty result rather than an error.
+
+```bash
+docker compose --profile tls up -d --build   # app + Postgres + automatic TLS
+```
 
 ## Roadmap
 

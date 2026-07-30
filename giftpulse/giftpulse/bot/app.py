@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher
 from giftpulse.bot.handlers import router
 from giftpulse.config import Settings, get_settings
 from giftpulse.db import init_db
+from giftpulse.venues.registry import close_shared_pool
 
 log = logging.getLogger(__name__)
 
@@ -36,4 +37,5 @@ async def run_bot(settings: Settings | None = None) -> None:
     try:
         await dispatcher.start_polling(bot)
     finally:
+        await close_shared_pool()
         await bot.session.close()

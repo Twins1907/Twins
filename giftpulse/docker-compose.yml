@@ -1,22 +1,42 @@
+# Default stack: app + Postgres.
+#
+#   docker compose up -d                      app on :8080, no TLS (put it behind
+#                                             your own proxy, or use the profile below)
+#   docker compose --profile tls up -d        adds Caddy, which gets a real
+#                                             certificate automatically
+#
+# Telegram will not open a Mini App over plain HTTP, so a production deployment
+# needs the tls profile or an equivalent proxy in front.
+
 services:
   giftpulse:
     build: .
     restart: unless-stopped
     env_file: .env
     environment:
-      GIFTPULSE_DATABASE_URL: postgresql+asyncpg://giftpulse:giftpulse@db:5432/giftpulse
+      GIFTPULSE_DATABASE_URL: postgresql+asyncpg://giftpulse:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/giftpulse
+    expose:
+      - "8080"
     ports:
-      - "8080:8080"
+      # Bound to localhost: with the tls profile Caddy is the only thing that
+      # should reach this, and publishing 0.0.0.0:8080 would expose the API
+      # directly regardless of the proxy.
+      - "127.0.0.1:8080:8080"
     depends_on:
       db:
         condition: service_healthy
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   db:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: giftpulse
-      POSTGRES_PASSWORD: giftpulse
+      # No default. A database reachable from the app network with a guessable
+      # password is not a starting point worth shipping.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: giftpulse
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -25,6 +45,29 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    environment:
+      # The hostname on the certificate. Must match GIFTPULSE_PUBLIC_URL and the
+      # Mini App URL registered with BotFather, or Telegram refuses to open it.
+      GIFTPULSE_DOMAIN: ${GIFTPULSE_DOMAIN:?set GIFTPULSE_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - giftpulse
 
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:

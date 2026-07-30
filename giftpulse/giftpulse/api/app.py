@@ -8,15 +8,18 @@ a verified ``initData`` header.
 from __future__ import annotations
 
 import logging
+import time
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from giftpulse import health
 from giftpulse.analytics import (
     change_pct,
     collection_overview,
@@ -31,11 +34,55 @@ from giftpulse.db import init_db, session_scope
 from giftpulse.indexer.service import TRACKED_COLLECTIONS
 from giftpulse.models import RoutedTrade, User, Watch
 from giftpulse.routing.engine import RoutingEngine
-from giftpulse.venues.registry import build_adapters, build_client
+from giftpulse.venues.registry import VenuePool, close_shared_pool, get_shared_pool
 
 log = logging.getLogger(__name__)
 
 MINIAPP_DIR = Path(__file__).resolve().parent.parent / "miniapp"
+
+# Headers applied to every response. The Mini App is entirely self-contained, so a
+# restrictive policy costs nothing and closes the obvious injection routes on a page
+# that will be showing people prices they are about to act on.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://telegram.org; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self' https:; "
+        "frame-ancestors https://web.telegram.org https://telegram.org"
+    ),
+}
+
+
+class RateLimiter:
+    """Per-user sliding window.
+
+    In-process and therefore per-worker: this is a guard against one enthusiastic
+    user melting our venue rate budget, not a distributed quota. Running multiple
+    API workers multiplies the effective limit, which is the right trade for
+    something with no external dependency.
+    """
+
+    def __init__(self, limit: int, window_seconds: float = 60.0) -> None:
+        self.limit = limit
+        self.window = window_seconds
+        self._hits: dict[int, deque[float]] = defaultdict(deque)
+
+    def check(self, key: int, now: float | None = None) -> bool:
+        if self.limit <= 0:
+            return True
+        moment = now if now is not None else time.monotonic()
+        hits = self._hits[key]
+        while hits and moment - hits[0] > self.window:
+            hits.popleft()
+        if len(hits) >= self.limit:
+            return False
+        hits.append(moment)
+        return True
 
 
 async def current_user(
@@ -58,26 +105,58 @@ class QuoteRequest(BaseModel):
     max_price_ton: float | None = Field(default=None, gt=0)
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    await init_db()
-    yield
-
-
 def create_app() -> FastAPI:
+    settings = get_settings()
+    quote_limiter = RateLimiter(settings.quote_rate_limit_per_minute)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        await init_db()
+        for warning in get_settings().startup_warnings():
+            log.warning("startup: %s", warning)
+        # One pool for the whole process, shared with the bot and indexer when they
+        # run alongside us under `giftpulse all`. Separate pools would each carry
+        # their own rate limiter, so the configured per-venue ceiling would be
+        # silently multiplied by the number of components running.
+        application.state.venues = get_shared_pool(get_settings())
+        try:
+            yield
+        finally:
+            await close_shared_pool()
+
     app = FastAPI(title="GiftPulse", version="0.1.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next) -> Response:  # noqa: ANN001
+        response = await call_next(request)
+        for name, value in _SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
+        return response
 
     # --- public market data ------------------------------------------------
 
     @app.get("/api/health")
-    async def health() -> dict:
+    async def health_endpoint() -> JSONResponse:
+        """Liveness for an uptime monitor.
+
+        Reports the *indexer's* health, not the API's. A responsive API serving
+        week-old floors is the failure worth paging about, and it is invisible to
+        any check that only asks whether the web process is up.
+        """
         settings = get_settings()
-        return {
-            "status": "ok",
+        async with session_scope() as session:
+            heartbeat = await health.read(session)
+
+        status = health.status_for(heartbeat, settings.cycle_stall_seconds)
+        payload = {
+            "status": status,
             "mock": settings.mock,
             "venues": settings.enabled_venues,
             "fee_bps": settings.execution_fee_bps,
+            "indexer": heartbeat,
         }
+        # 503 on degraded so a monitor notices without having to parse the body.
+        return JSONResponse(payload, status_code=200 if status != "degraded" else 503)
 
     @app.get("/api/collections")
     async def collections() -> list[dict]:
@@ -100,9 +179,15 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/history/{collection}")
-    async def history(collection: str, hours: int = Query(default=24, ge=1, le=720)) -> list[dict]:
+    async def history(
+        collection: str,
+        hours: int = Query(default=24, ge=1, le=720),
+        max_points: int = Query(default=180, ge=10, le=1000),
+    ) -> list[dict]:
         async with session_scope() as session:
-            return await floor_history(session, collection, hours=hours)
+            return await floor_history(
+                session, collection, hours=hours, max_points=max_points
+            )
 
     @app.get("/api/stats")
     async def stats() -> dict:
@@ -112,15 +197,25 @@ def create_app() -> FastAPI:
     # --- authenticated -----------------------------------------------------
 
     @app.post("/api/quote")
-    async def quote(request: QuoteRequest, user: TelegramUser = Depends(current_user)) -> dict:
-        """Best executable price across venues, recorded against the user."""
+    async def quote(
+        request: Request,
+        payload: QuoteRequest,
+        user: TelegramUser = Depends(current_user),
+    ) -> dict:
+        """Best executable price across venues, recorded against the user.
+
+        This is the only endpoint that fans out to live venue APIs, which makes it
+        the one place a single user can turn into a venue-side rate-limit problem.
+        """
+        if not quote_limiter.check(user.telegram_id):
+            raise HTTPException(
+                status_code=429, detail="too many quotes, slow down for a moment"
+            )
+
         settings = get_settings()
-        client = build_client(settings)
-        try:
-            engine = RoutingEngine(build_adapters(client, settings), settings)
-            best = await engine.best_buy(request.collection, request.max_price_ton)
-        finally:
-            await client.aclose()
+        pool: VenuePool = request.app.state.venues
+        engine = RoutingEngine(pool.adapters, settings)
+        best = await engine.best_buy(payload.collection, payload.max_price_ton)
 
         if best is None:
             raise HTTPException(status_code=404, detail="no listings match that request")
@@ -134,7 +229,10 @@ def create_app() -> FastAPI:
                     listing_id=best.listing.listing_id,
                     price_ton=best.price_ton,
                     fee_ton=best.fee_ton,
-                    status="built",
+                    # A price was shown, nothing was signed. Promoting this to a
+                    # trade is what would inflate routed volume with window
+                    # shoppers.
+                    status=RoutedTrade.QUOTED,
                 )
             )
 

@@ -113,29 +113,71 @@ class AlertEngine:
             return snapshot
 
         # Cold start: nothing that old exists yet. Fall back to the oldest row we
-        # have so a fresh deployment still produces signal on day one.
+        # have, but only once it is old enough to be a real baseline. Comparing
+        # against a snapshot from the previous poll turns every rule into a
+        # 60-second momentum detector and buries a launch-day channel in noise.
+        floor_age = datetime.now(UTC) - timedelta(
+            minutes=self.settings.alert_min_baseline_minutes
+        )
         result = await session.execute(
             select(FloorSnapshot)
-            .where(FloorSnapshot.venue == venue, FloorSnapshot.collection == collection)
+            .where(
+                FloorSnapshot.venue == venue,
+                FloorSnapshot.collection == collection,
+                FloorSnapshot.captured_at <= floor_age,
+            )
             .order_by(FloorSnapshot.captured_at.asc())
             .limit(1)
         )
         return result.scalar_one_or_none()
 
 
-async def record_sales(session: AsyncSession, sales: list[Sale]) -> int:
-    """Persist sales we have not already seen. Returns the number newly stored."""
-    stored = 0
-    for sale in sales:
-        exists = await session.execute(
-            select(SaleEvent.id).where(
-                SaleEvent.venue == sale.venue,
-                SaleEvent.gift_id == sale.gift_id,
-                SaleEvent.occurred_at == sale.occurred_at,
-            )
+def _as_utc(moment: datetime) -> datetime:
+    """Normalize a timestamp for comparison.
+
+    SQLite hands back naive datetimes even from a ``DateTime(timezone=True)``
+    column, so identity comparisons have to meet on common ground or every stored
+    sale looks new on the next poll.
+    """
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+async def record_sales(session: AsyncSession, sales: list[Sale]) -> list[Sale]:
+    """Persist sales we have not already seen. Returns the ones newly stored.
+
+    Returning the new sales rather than a count is what stops the whale rule
+    re-alerting: venues keep a sale in their "recent" feed for hours, so evaluating
+    every fetched sale re-fires the same whale buy on every cooldown expiry until it
+    finally rolls off the feed.
+
+    Existence is checked with one query for the whole batch. The obvious
+    row-at-a-time version costs a round trip per sale — roughly 600 per cycle at
+    eight collections across three venues, which is most of a cycle's time budget
+    spent asking SQLite the same question.
+    """
+    if not sales:
+        return []
+
+    oldest = min(_as_utc(sale.occurred_at) for sale in sales)
+    existing_rows = await session.execute(
+        select(SaleEvent.venue, SaleEvent.gift_id, SaleEvent.occurred_at).where(
+            SaleEvent.venue.in_({sale.venue for sale in sales}),
+            SaleEvent.gift_id.in_({sale.gift_id for sale in sales}),
+            SaleEvent.occurred_at >= oldest,
         )
-        if exists.scalar_one_or_none() is not None:
+    )
+    seen = {
+        (venue, gift_id, _as_utc(occurred_at)) for venue, gift_id, occurred_at in existing_rows
+    }
+
+    stored: list[Sale] = []
+    for sale in sales:
+        identity = (sale.venue, sale.gift_id, _as_utc(sale.occurred_at))
+        # Guard against duplicates inside this batch too, not just against the
+        # table — a venue occasionally returns the same sale twice in one page.
+        if identity in seen:
             continue
+        seen.add(identity)
         session.add(
             SaleEvent(
                 venue=sale.venue,
@@ -148,5 +190,5 @@ async def record_sales(session: AsyncSession, sales: list[Sale]) -> int:
                 occurred_at=sale.occurred_at,
             )
         )
-        stored += 1
+        stored.append(sale)
     return stored
